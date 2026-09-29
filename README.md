@@ -10,15 +10,20 @@
 
 ---
 
-## ⚠️ 必装前置：配套的 NapCat 插件
+## 视频取回方式
 
-**不装它，本插件一行都跑不通。**
+### SnowLuma 适配器
 
-QQ 收到视频**不会把原片下载下来**，只存一张封面图；而消息适配器又会把视频段
-压成纯文本、把下载地址丢掉。所以在服务器上，视频文件根本不存在。
+使用 MaiBot SnowLuma Adapter 时，插件会通过 `adapter.snowluma.message.get_msg`
+读取原始消息里的视频 URL，再由现有下载流程取回原片。**不需要安装本仓库的 NapCat
+辅助插件，也不需要新增视频取回配置。**
 
-本项目自带一个 NapCat 插件（`napcat-plugin/video-fetch/`）专门解决这件事：
-它监听视频消息，拿到真实下载地址，把原片存到本地目录，供本插件取用。
+### NapCat：配套下载插件
+
+**只有使用 NapCat 适配器时，才需要配套的 NapCat 插件。** QQ 收到视频通常不会把
+原片下载到服务器；消息适配器也会把视频段压成文本占位并丢掉下载地址。因此需要本仓库
+自带的 NapCat 插件（`napcat-plugin/video-fetch/`）：它监听视频消息，把原片下载到本地，
+供本插件取用。
 
 **安装步骤（缺一不可）**：
 
@@ -33,7 +38,8 @@ QQ 收到视频**不会把原片下载下来**，只存一张封面图；而消�
 
 1. 把本仓库整个目录放到麦麦的 `plugins/` 下（目录名建议 `video-understanding`）。
    **仓库根目录就是插件本体**，根下直接有 `_manifest.json`。
-2. **装好上面那个 NapCat 插件**。
+2. 使用 NapCat 适配器时，按「NapCat：配套下载插件」一节安装辅助插件；使用 SnowLuma
+   Adapter 时跳过此步。
 3. 在 WebUI 启用本插件。
 4. **`extract.ffmpeg_path` / `extract.ffprobe_path` 填绝对路径。**
    麦麦进程继承的 PATH 可能是很久以前的，`shutil.which("ffmpeg")` 会返回 `None`，
@@ -106,9 +112,9 @@ keep_video_hours = 24      # 保留时长，超时自动删
 | 视觉 | mode | host | host 走主程序任务 / direct 直连接口 |
 | 视觉 | api_url / api_key / model | 空 | direct 模式用 |
 | 缓存 | enabled / match_threshold | true / 0.9 | 相似视频复用描述 |
-| NapCat | fetch_dir | 空 | **取回插件的下载目录，建议填** |
-| NapCat | fetch_wait_s | 60 | 等下载完成的最长秒数 |
-| NapCat | fetch_keep_hours | 24 | 取回目录里文件的最长保留小时数 |
+| NapCat | fetch_dir | 空 | NapCat 专用：取回插件的下载目录，建议填；SnowLuma 不使用 |
+| NapCat | fetch_wait_s | 60 | NapCat 专用：等下载完成的最长秒数 |
+| NapCat | fetch_keep_hours | 24 | NapCat 专用：取回目录里文件的最长保留小时数 |
 | 视频源 | cleanup_after | true | 理解完成后删除视频与中间文件 |
 | 视频源 | max_video_mb | 80 | 超过该体积跳过 |
 | 视频源 | max_videos_per_message / concurrency | 3 / 1 | 单条消息上限 / 同时处理数 |
@@ -137,13 +143,15 @@ keep_video_hours = 24      # 保留时长，超时自动删
 - **隔很久再问需要引用原消息**。只口头说「刚才那个视频」、而且上下文已经过期时，
   它定位不到是哪条
 - 同一时间有多个视频、你只说「那个视频」时，靠模型自己判断，拿不准它会先问你
-- 需要自己准备：ffmpeg、配套的 NapCat 插件、（可选）sherpa-onnx
+- SnowLuma 需要适配器的 `get_msg` 返回原始视频段和可用 URL；NapCat 需要配套下载插件
+- 需要自己准备：ffmpeg；使用 NapCat 时还需配套插件；（可选）sherpa-onnx
 
 ## 依赖
 
 - ffmpeg / ffprobe（必须，建议配绝对路径）
 - 主程序 1.0.0+，SDK 2.0.0+
-- 配套 NapCat 插件（本仓库 `napcat-plugin/video-fetch/`）
+- NapCat 适配器：配套 NapCat 插件（本仓库 `napcat-plugin/video-fetch/`）
+- SnowLuma 适配器：无需额外取回插件或新增取回配置
 - 可选：sherpa-onnx（本地音频模式）
 
 ## 许可
