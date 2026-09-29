@@ -10,13 +10,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import http.client
+import ipaddress
 import re
 import socket
-import urllib.request
+import ssl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
@@ -142,39 +144,148 @@ def _from_text(text: str) -> list[VideoAsset]:
 # ---------------- 落盘 ----------------
 
 def _is_public_url(url: str) -> bool:
-    """粗略的 SSRF 防护：拒绝内网与元数据地址。"""
+    """解析 URL 并确认主机解析到的地址均为公网地址。"""
 
     try:
         parsed = urlparse(url)
-    except Exception:
-        return False
-    if parsed.scheme not in {"http", "https"}:
-        return False
-    host = parsed.hostname or ""
-    if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
-        return False
-    try:
-        ip = socket.gethostbyname(host)
-    except OSError:
-        return True  # 解析不了就交给下载阶段报错
-    parts = ip.split(".")
-    if len(parts) == 4:
-        a, b = int(parts[0]), int(parts[1])
-        if a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or a == 127:
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None):
             return False
+        explicit_port = parsed.port
+        port = explicit_port if explicit_port is not None else (
+            443 if parsed.scheme == "https" else 80)
+        _resolve_addresses(parsed.hostname, port)
+    except (OSError, TypeError, ValueError):
+        return False
     return True
+
+
+def _resolve_addresses(host: str, port: int, *, allow_private: bool = False) -> list[str]:
+    """解析一次并返回将要直连的 IP，避免校验与连接之间的 DNS 重绑定。"""
+
+    try:
+        records = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    except OSError:
+        raise ValueError("无法解析视频地址") from None
+    addresses = list(dict.fromkeys(record[4][0].split("%", 1)[0]
+                                   for record in records))
+    if not addresses:
+        raise ValueError("视频地址没有可用的网络地址")
+    if not allow_private:
+        try:
+            public = [ipaddress.ip_address(address).is_global for address in addresses]
+        except ValueError:
+            raise ValueError("视频地址解析失败") from None
+        if not all(public):
+            raise ValueError("拒绝下载非公网地址")
+    return addresses
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """连接到已校验的 IP，同时保留原始 Host 头。"""
+
+    def __init__(self, host: str, port: int, address: str, timeout_s: float):
+        super().__init__(host, port, timeout=timeout_s)
+        self._address = address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._address, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """直连已校验的 IP，并用原始主机名验证 TLS 证书与 SNI。"""
+
+    def __init__(self, host: str, port: int, address: str, timeout_s: float):
+        super().__init__(host, port, timeout=timeout_s, context=ssl.create_default_context())
+        self._address = address
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self._address, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except Exception:
+            raw.close()
+            raise
 
 
 def _download_sync(url: str, *, timeout_s: float, max_bytes: int,
                    allow_private: bool = False) -> bytes:
-    if not allow_private and not _is_public_url(url):
-        raise ValueError(f"拒绝下载非公网地址：{url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "maivideo/0.1"})
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        data = resp.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise ValueError(f"下载内容过大：{len(data)} > {max_bytes}")
-    return data
+    current_url = url
+    previous_scheme = ""
+    redirect_statuses = {301, 302, 303, 307, 308}
+
+    # 最多跟随五次重定向；每一跳都重新解析、校验并固定目标 IP。
+    for redirect_count in range(6):
+        try:
+            parsed = urlparse(current_url)
+            scheme = parsed.scheme.lower()
+            host = parsed.hostname or ""
+            if (scheme not in {"http", "https"} or not host
+                    or parsed.username is not None or parsed.password is not None):
+                raise ValueError("视频地址格式无效")
+            if previous_scheme == "https" and scheme != "https":
+                raise ValueError("拒绝不安全的视频地址跳转")
+            explicit_port = parsed.port
+            port = explicit_port if explicit_port is not None else (
+                443 if scheme == "https" else 80)
+            if not 1 <= port <= 65535:
+                raise ValueError("视频地址端口无效")
+            addresses = _resolve_addresses(host, port, allow_private=allow_private)
+            host_header = f"[{host}]" if ":" in host else host
+            if explicit_port is not None:
+                host_header = f"{host_header}:{port}"
+            request_target = parsed.path or "/"
+            if parsed.query:
+                request_target = f"{request_target}?{parsed.query}"
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("视频地址格式无效") from None
+
+        redirect_url = ""
+        for address in addresses:
+            if scheme == "https":
+                conn = _PinnedHTTPSConnection(host, port, address, timeout_s)
+            else:
+                conn = _PinnedHTTPConnection(host, port, address, timeout_s)
+            try:
+                conn.request("GET", request_target, headers={
+                    "Host": host_header,
+                    "User-Agent": "maivideo/0.1",
+                    "Accept": "*/*",
+                    "Connection": "close",
+                })
+                response = conn.getresponse()
+                if response.status in redirect_statuses:
+                    location = response.getheader("Location")
+                    if not location:
+                        raise ValueError("视频地址返回了无目标的重定向")
+                    redirect_url = urljoin(current_url, location)
+                    break
+                if not 200 <= response.status < 300:
+                    raise ValueError(f"视频下载返回 HTTP {response.status}")
+                data = response.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ValueError(f"下载内容过大：{len(data)} > {max_bytes}")
+                return data
+            except ValueError:
+                raise
+            except (OSError, http.client.HTTPException, ssl.SSLError):
+                # 不把底层异常写入日志，避免泄露 URL 中的签名查询参数。
+                continue
+            finally:
+                conn.close()
+
+        if redirect_url:
+            if redirect_count == 5:
+                raise ValueError("视频地址重定向次数过多")
+            previous_scheme = scheme
+            current_url = redirect_url
+            continue
+        raise ValueError("视频下载网络请求失败") from None
+
+    raise ValueError("视频地址重定向次数过多")
 
 
 async def materialize(asset: VideoAsset, *, target_dir: Path, timeout_s: float,

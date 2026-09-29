@@ -831,7 +831,8 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                                         traceback.format_exc()[-800:])
             finally:
                 if bool(self.config.source.cleanup_after):
-                    await asyncio.to_thread(self._cleanup, asset, video_path, key)
+                    await asyncio.to_thread(
+                        self._cleanup, asset, video_path, key, client_type)
                 await asyncio.to_thread(self._maybe_purge_fetch)
 
     @staticmethod
@@ -858,7 +859,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         return cand
 
     def _cleanup(self, asset: media_mod.VideoAsset, video_path: Path | None,
-                 key: str = "") -> None:
+                 key: str = "", client_type: str = "") -> None:
         """清理视频本体与中间产物（帧 / 音频）。描述已入签名缓存，删除不影响复用。
 
         keep_video 打开时，先把原片备份到数据目录，再照常清理。
@@ -882,7 +883,11 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         cands = []
         if video_path is not None:
             cands.append(Path(video_path))
-        fetch_dir = str(self.config.napcat.fetch_dir or "").strip()
+        # SnowLuma 文件名可能与共享 NapCat 暂存目录中的其他文件相同，
+        # 因此只允许 NapCat 消息清理该目录。
+        is_snowluma = str(client_type or "").strip().lower() == "snowluma"
+        fetch_dir = ("" if is_snowluma else
+                     str(self.config.napcat.fetch_dir or "").strip())
         if fetch_dir:
             base = Path(fetch_dir)
             for name in (asset.name, asset.file_ref):
@@ -948,7 +953,9 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                 direct_error = exc
                 if not is_snowluma and not (asset.file_ref or asset.name):
                     raise
-                self.ctx.logger.info("直接落盘失败，尝试取回来源视频：%s", exc)
+                self.ctx.logger.info(
+                    "直接落盘失败，尝试取回来源视频，错误类型=%s",
+                    type(exc).__name__)
 
         # SnowLuma 的入站转换会把视频段变成文本占位，且不提供视频 get_file；
         # get_msg 返回的原始消息仍含有视频 URL。
@@ -1039,10 +1046,12 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             return next(iter(matching_urls))
         if len(matching_urls) > 1:
             raise RuntimeError("SnowLuma 消息中有多个视频匹配当前素材，无法安全选择")
-        if len(video_urls) == 1:
+        if not asset_names and len(video_urls) == 1:
             return next(iter(video_urls))
         if not video_urls:
             raise RuntimeError("SnowLuma 原消息中没有可用的视频 URL")
+        if asset_names:
+            raise RuntimeError("SnowLuma 消息中的视频都无法对应当前素材")
         raise RuntimeError("SnowLuma 消息包含多个视频，无法与当前素材对应")
 
     async def _wait_fetched(self, fetch_dir: str, asset: media_mod.VideoAsset) -> Path | None:
