@@ -14,6 +14,7 @@ import base64
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import (ErrorPolicy, HookMode, HookOrder,
@@ -351,13 +352,17 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                       if isinstance(msg_info, dict) else None)
         group_id = (str(group_info.get("group_id") or "")
                     if isinstance(group_info, dict) else "")
+        additional_config = (msg_info.get("additional_config")
+                             if isinstance(msg_info, dict) else None)
+        client_type = (str(additional_config.get("client_type") or "").strip().lower()
+                       if isinstance(additional_config, dict) else "")
         message_id = str(message.get("message_id") or "")
         self.ctx.logger.info("检测到 %d 个视频 session=%s group=%s msg=%s",
                              len(assets), stream_id or "-", group_id or "-",
                              message_id or "-")
         for asset in assets:
             task = asyncio.create_task(
-                self._handle(asset, stream_id, group_id, message_id))
+                self._handle(asset, stream_id, group_id, message_id, client_type))
             self._bg.add(task)
             task.add_done_callback(self._bg.discard)
 
@@ -760,7 +765,8 @@ class VideoUnderstandPlugin(MaiBotPlugin):
     # ---- 处理流水线 ----
 
     async def _handle(self, asset: media_mod.VideoAsset, stream_id: str,
-                      group_id: str = "", message_id: str = "") -> None:
+                      group_id: str = "", message_id: str = "",
+                      client_type: str = "") -> None:
         assert self._sem is not None
         video_path: Path | None = None
         name = str(asset.name or asset.file_ref or "")
@@ -777,7 +783,8 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                                            why="已有同名时间轴"):
                     return
                 try:
-                    video_path = await self._materialize(asset)
+                    video_path = await self._materialize(
+                        asset, message_id=message_id, client_type=client_type)
                 except FileNotFoundError:
                     # 兜底：上面的按名查没命中，但取回也失败
                     if self._reuse_by_filename(asset, stream_id, message_id):
@@ -911,17 +918,19 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         if removed:
             self.ctx.logger.info("已清理视频文件 %d 项", len(removed))
 
-    async def _materialize(self, asset: media_mod.VideoAsset) -> Path:
-        """落盘；优先用 NapCat 取回插件的下载目录，其次直取，最后 NapCat get_file。"""
+    async def _materialize(self, asset: media_mod.VideoAsset, *,
+                           message_id: str = "", client_type: str = "") -> Path:
+        """落盘；SnowLuma 从原消息取回 URL，NapCat 保留现有取回流程。"""
 
         cfg = self.config
+        is_snowluma = str(client_type or "").strip().lower() == "snowluma"
         runtime = Path(self.ctx.paths.runtime_dir) / "videos" / asset.key[:16]
         max_bytes = int(float(cfg.source.max_video_mb) * 1024 * 1024)
         timeout_s = max(5.0, float(cfg.audio.timeout_s))
 
         # 1) NapCat 取回插件的下载目录（video-fetch 插件把真实视频存这里）
         fetch_dir = str(cfg.napcat.fetch_dir or "").strip()
-        if fetch_dir:
+        if fetch_dir and not is_snowluma:
             got = await self._wait_fetched(fetch_dir, asset)
             if got is not None and got.stat().st_size <= max_bytes:
                 return got
@@ -930,14 +939,38 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             raise FileNotFoundError(f"取回目录未找到视频：{asset.name or asset.file_ref}")
 
         # 2) 自带来源（url / base64 / 本地路径）
+        direct_error: Exception | None = None
         if asset.url or asset.base64_data or asset.local_path:
             try:
                 return await media_mod.materialize(
                     asset, target_dir=runtime, timeout_s=timeout_s, max_bytes=max_bytes)
             except Exception as exc:  # noqa: BLE001
-                if not (asset.file_ref or asset.name):
+                direct_error = exc
+                if not is_snowluma and not (asset.file_ref or asset.name):
                     raise
-                self.ctx.logger.info("直接落盘失败，尝试 NapCat：%s", exc)
+                self.ctx.logger.info("直接落盘失败，尝试取回来源视频：%s", exc)
+
+        # SnowLuma 的入站转换会把视频段变成文本占位，且不提供视频 get_file；
+        # get_msg 返回的原始消息仍含有视频 URL。
+        if is_snowluma:
+            if not message_id:
+                if direct_error is not None:
+                    raise direct_error
+                raise RuntimeError("SnowLuma 视频取回需要原消息 ID")
+            response = await self.ctx.api.call(
+                "adapter.snowluma.message.get_msg",
+                version="1",
+                message_id=message_id,
+            )
+            url = self._snowluma_video_url(response, asset)
+            recovered = media_mod.VideoAsset(
+                name=asset.name or Path(urlparse(url).path).name,
+                file_ref=asset.file_ref,
+                url=url,
+                source=asset.source,
+            )
+            return await media_mod.materialize(
+                recovered, target_dir=runtime, timeout_s=timeout_s, max_bytes=max_bytes)
 
         # 3) NapCat OneBot get_file
         ref = str(asset.file_ref or asset.name or "").strip()
@@ -949,6 +982,68 @@ class VideoUnderstandPlugin(MaiBotPlugin):
         name = asset.name or ref
         return await asyncio.to_thread(
             media_mod.save_bytes, raw, target_dir=runtime, name=name, key=asset.key)
+
+    @staticmethod
+    def _snowluma_video_url(response: Any, asset: media_mod.VideoAsset) -> str:
+        """从 SnowLuma get_msg 的原始消息中定位当前素材的视频 URL。"""
+
+        detail = response
+        if isinstance(detail, dict) and isinstance(detail.get("data"), dict):
+            detail = detail["data"]
+        if not isinstance(detail, dict):
+            raise RuntimeError("SnowLuma get_msg 未返回消息详情")
+        segments = detail.get("message")
+        if not isinstance(segments, list):
+            raise RuntimeError("SnowLuma get_msg 返回的消息没有原始分段")
+
+        def name_key(value: Any) -> str:
+            raw = str(value or "").strip().replace("\\", "/")
+            if raw.lower().startswith(("http://", "https://")):
+                raw = urlparse(raw).path
+            return raw.rsplit("/", 1)[-1].casefold()
+
+        asset_names = {name_key(value) for value in (asset.name, asset.file_ref) if value}
+        asset_names.discard("")
+        video_urls: set[str] = set()
+        matching_urls: set[str] = set()
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            if str(segment.get("type") or "").strip().lower() not in {
+                "video", "short_video", "video_file",
+            }:
+                continue
+            data = segment.get("data")
+            if isinstance(data, str):
+                url = data.strip()
+                segment_names: set[str] = set()
+            elif isinstance(data, dict):
+                url = str(data.get("url") or data.get("file_url") or "").strip()
+                segment_names = {
+                    name_key(data.get(key))
+                    for key in ("file", "file_id", "file_name", "filename", "name")
+                    if data.get(key)
+                }
+            else:
+                continue
+            if not url.lower().startswith(("http://", "https://")):
+                continue
+            url_name = name_key(url)
+            if url_name:
+                segment_names.add(url_name)
+            video_urls.add(url)
+            if asset_names.intersection(segment_names):
+                matching_urls.add(url)
+
+        if len(matching_urls) == 1:
+            return next(iter(matching_urls))
+        if len(matching_urls) > 1:
+            raise RuntimeError("SnowLuma 消息中有多个视频匹配当前素材，无法安全选择")
+        if len(video_urls) == 1:
+            return next(iter(video_urls))
+        if not video_urls:
+            raise RuntimeError("SnowLuma 原消息中没有可用的视频 URL")
+        raise RuntimeError("SnowLuma 消息包含多个视频，无法与当前素材对应")
 
     async def _wait_fetched(self, fetch_dir: str, asset: media_mod.VideoAsset) -> Path | None:
         """等待取回目录里出现**当前这条且已写完**的视频。
