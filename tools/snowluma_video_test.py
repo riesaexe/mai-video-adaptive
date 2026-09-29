@@ -121,6 +121,35 @@ else:
     mismatch_rejected = False
 check("唯一 URL 也不得回退到不匹配的素材", mismatch_rejected)
 
+url_only_asset = P.media_mod.VideoAsset(
+    url="https://cdn.example/clip-1.mp4?signature=old-fixture")
+check("URL-only 素材按原 URL 文件名匹配",
+      P.VideoUnderstandPlugin._snowluma_video_url(response, url_only_asset) ==
+      "https://cdn.example/clip-1.mp4?signature=fixture")
+
+url_only_message = {"raw_message": [
+    {"type": "video", "data": {
+        "url": "https://cdn.example/clip-1.mp4?signature=fixture",
+    }},
+    {"type": "video", "data": {
+        "file": "clip-2.mp4",
+        "url": "https://cdn.example/clip-2.mp4?signature=fixture",
+    }},
+]}
+url_only_asset = P.media_mod.extract_assets(url_only_message)[0]
+partial_response = {"message": [
+    {"type": "video", "data": {"file": "clip-1.mp4"}},
+    response["data"]["message"][1],
+]}
+try:
+    P.VideoUnderstandPlugin._snowluma_video_url(partial_response, url_only_asset)
+except RuntimeError:
+    partial_mismatch_rejected = True
+else:
+    partial_mismatch_rejected = False
+check("多视频中 URL-only 素材不误取另一个唯一 URL",
+      partial_mismatch_rejected)
+
 single = {"message": [response["data"]["message"][0]]}
 check("没有素材标识时保留唯一 URL 回退",
       P.VideoUnderstandPlugin._snowluma_video_url(

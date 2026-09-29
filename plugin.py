@@ -1009,8 +1009,11 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                 raw = urlparse(raw).path
             return raw.rsplit("/", 1)[-1].casefold()
 
-        asset_names = {name_key(value) for value in (asset.name, asset.file_ref) if value}
+        asset_labels = tuple(value for value in (asset.name, asset.file_ref) if value)
+        has_asset_label = bool(asset_labels)
+        asset_names = {name_key(value) for value in (*asset_labels, asset.url) if value}
         asset_names.discard("")
+        video_segment_count = 0
         video_urls: set[str] = set()
         matching_urls: set[str] = set()
         for segment in segments:
@@ -1020,6 +1023,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
                 "video", "short_video", "video_file",
             }:
                 continue
+            video_segment_count += 1
             data = segment.get("data")
             if isinstance(data, str):
                 url = data.strip()
@@ -1046,7 +1050,7 @@ class VideoUnderstandPlugin(MaiBotPlugin):
             return next(iter(matching_urls))
         if len(matching_urls) > 1:
             raise RuntimeError("SnowLuma 消息中有多个视频匹配当前素材，无法安全选择")
-        if not asset_names and len(video_urls) == 1:
+        if not has_asset_label and video_segment_count == 1 and len(video_urls) == 1:
             return next(iter(video_urls))
         if not video_urls:
             raise RuntimeError("SnowLuma 原消息中没有可用的视频 URL")
