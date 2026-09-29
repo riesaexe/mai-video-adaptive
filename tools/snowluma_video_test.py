@@ -127,6 +127,20 @@ check("URL-only 素材按原 URL 文件名匹配",
       P.VideoUnderstandPlugin._snowluma_video_url(response, url_only_asset) ==
       "https://cdn.example/clip-1.mp4?signature=fixture")
 
+try:
+    P.VideoUnderstandPlugin._snowluma_video_url(
+        {"message": [{"type": "video", "data": {
+            "url": "https://cdn.example/clip-2.mp4?signature=fixture",
+        }}]},
+        url_only_asset,
+    )
+except RuntimeError:
+    single_url_mismatch_rejected = True
+else:
+    single_url_mismatch_rejected = False
+check("单视频 URL-only 素材也拒绝不匹配的文件名",
+      single_url_mismatch_rejected)
+
 url_only_message = {"raw_message": [
     {"type": "video", "data": {
         "url": "https://cdn.example/clip-1.mp4?signature=fixture",
