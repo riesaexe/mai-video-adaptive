@@ -25,7 +25,7 @@
 自带的 NapCat 插件（`napcat-plugin/video-fetch/`）：它监听视频消息，把原片下载到本地，
 供本插件取用。
 
-**安装步骤（缺一不可）**：
+**安装步骤（使用 Napcat 适配器时缺一不可，使用 SnowLuma 时请忽视）**：
 
 1. 把 `napcat-plugin/video-fetch/` 整个目录放进麦麦的 `napcat/plugins/` 下
 2. 在 `napcat/config/plugins.json` 写入 `{"video-fetch": true}`
@@ -162,5 +162,3 @@ keep_video_hours = 24      # 保留时长，超时自动删
 - **可以**：个人使用、研究学习、公益 / 教育 / 政府等非商业用途
 - **不可以**：任何商业用途——无论是原样还是改过的，开源还是闭源
 - 分发时必须一并附上 `LICENSE`
-
-选它的原因：允许传播和闭源衍生，但挡住「拿去包装成收费服务」。
